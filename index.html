@@ -9085,7 +9085,150 @@
 
             // Внедряем данные проекта в HTML
             const injection =
-                `<!-- ======================== ИНТЕГРАЦИЯ WEBMEJI ======================== -->
+                `<script id="embedded-data-script">window.__EMBEDDED_PROJECT__ = ${JSON.stringify(projectData)};<\/script>`;
+            htmlContent = htmlContent.replace('</head>', injection + '\n</head>');
+
+            const blob = new Blob(['<!DOCTYPE html>\n<html lang="ru">\n' + htmlContent], { type: 'text/html;charset=utf-8' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            let filename = (state.projectTitle || "postprostranstvo").replace(/[\\/:*?"<>|]/g, '_').trim();
+            if (!filename) filename = "postprostranstvo";
+            a.download = filename + "_viewer.html";
+            a.click();
+            showNotification('Просмотровый HTML экспортирован', 'success', 3000);
+        });
+
+        // ===== СОХРАНИТЬ ДЛЯ PAGES (media/ + лёгкий project.json + index.html) =====
+        document.getElementById('savePagesBtn').addEventListener('click', async () => {
+            toggleSizePopup(); // Скрываем меню перед экспортом (и перед снимком outerHTML)
+
+            const overlay = document.getElementById('loadingOverlay');
+            overlay.classList.add('show');
+            const loaderText = overlay.querySelector('.loader-text');
+            const originalText = loaderText.textContent;
+            loaderText.textContent = 'Подготовка файлов для Pages...';
+
+            try {
+                const zip = new JSZip();
+                const mediaRoot = zip.folder('media');
+                const folders = {
+                    photo: mediaRoot.folder('photo'),
+                    doc: mediaRoot.folder('doc'),
+                    video: mediaRoot.folder('video'),
+                    audio: mediaRoot.folder('audio'),
+                    '3d': mediaRoot.folder('3d')
+                };
+                let counters = { photo: 1, doc: 1, video: 1, audio: 1, '3d': 1 };
+
+                // Добавляет файл (base64 data URL ИЛИ обычный путь/URL — оба варианта
+                // читаются через fetch) в архив и возвращает новый относительный путь
+                const addMediaFile = async (src, typeGroup, ext) => {
+                    if (!src || !folders[typeGroup]) return null;
+                    try {
+                        const resp = await fetch(src);
+                        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                        const blob = await resp.blob();
+                        const idx = counters[typeGroup]++;
+                        const fName = `${typeGroup}_${String(idx).padStart(3, '0')}.${ext}`;
+                        folders[typeGroup].file(fName, blob);
+                        return `media/${typeGroup}/${fName}`;
+                    } catch (e) {
+                        console.error('Не удалось добавить файл в архив:', src, e);
+                        return null;
+                    }
+                };
+
+                // Клонируем слайды, чтобы не трогать текущее состояние редактора
+                const slidesForExport = JSON.parse(JSON.stringify(state.slides));
+
+                loaderText.textContent = 'Сбор медиафайлов...';
+                for (const slide of slidesForExport) {
+                    for (const item of slide.items) {
+                        let typeGroup = item.type;
+                        if (['pdf', 'doc', 'docx', 'txt'].includes(typeGroup)) typeGroup = 'doc';
+
+                        if (folders[typeGroup] && item.src) {
+                            let ext = 'bin';
+                            if (typeGroup === 'photo') ext = 'png';
+                            else if (typeGroup === 'video') ext = 'mp4';
+                            else if (typeGroup === 'audio') ext = 'mp3';
+                            else if (item.type === '3d') ext = item.format || 'fbx';
+                            else if (typeGroup === 'doc') ext = item.type;
+
+                            const newPath = await addMediaFile(item.src, typeGroup, ext);
+                            if (newPath) item.src = newPath;
+                        }
+
+                        if (item.cover) {
+                            const newCoverPath = await addMediaFile(item.cover, 'photo', 'png');
+                            if (newCoverPath) item.cover = newCoverPath;
+                        }
+                        if (item.poster) {
+                            const newPosterPath = await addMediaFile(item.poster, 'photo', 'png');
+                            if (newPosterPath) item.poster = newPosterPath;
+                        }
+                    }
+                }
+
+                // Лёгкий project.json (с путями, а не base64)
+                const creaturesData = window.WebmejiManager ? window.WebmejiManager.getCreaturesDataForSave() : null;
+                const cf = document.getElementById('cinematicFrame');
+                const projectData = {
+                    slides: slidesForExport,
+                    uid,
+                    projectTitle: state.projectTitle,
+                    creatures: creaturesData,
+                    slideW: slideW,
+                    slideH: slideH,
+                    perfVisible: perfVisible,
+                    cinematicVisible: cf ? cf.classList.contains('show') : true,
+                    editorRestricted: editorRestricted,
+                    editorPassword: editorPassword || '',
+                    imgEffectsLevel: imgEffectsLevel
+                };
+                zip.file('project.json', JSON.stringify(projectData));
+
+                // index.html — сама страница-просмотрщик (чистый шаблон, без отрисованного
+                // проекта и без встроенных данных), при открытии на Pages она сама
+                // подхватит project.json и media/ рядом
+                loaderText.textContent = 'Сборка index.html...';
+                let cleanHtml = window.__PRISTINE_HTML__;
+                if (cleanHtml) {
+                    // На всякий случай вырезаем возможный встроенный скрипт с данными проекта
+                    cleanHtml = cleanHtml.replace(/<script id="embedded-data-script">[\s\S]*?<\/script>\s*/i, '');
+                } else {
+                    // Резервный вариант, если чистый исходник не удалось загрузить
+                    // (например, страница открыта без сервера, напрямую с диска)
+                    showNotification('Не удалось получить чистый шаблон страницы — используется текущее состояние', 'error', 4000);
+                    const oldScript = document.getElementById('embedded-data-script');
+                    if (oldScript) oldScript.remove();
+                    cleanHtml = '<!DOCTYPE html>\n<html lang="ru">\n' + document.documentElement.outerHTML;
+                }
+                zip.file('index.html', cleanHtml);
+
+                loaderText.textContent = 'Сохранение архива...';
+                const blob = await zip.generateAsync({ type: 'blob' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                let filename = (state.projectTitle || "postprostranstvo").replace(/[\\/:*?"<>|]/g, '_').trim();
+                if (!filename) filename = "postprostranstvo";
+                a.download = filename + "_pages.zip";
+                a.click();
+                showNotification('Архив для Pages сохранён', 'success', 3000);
+            } catch (err) {
+                console.error(err);
+                showNotification('Ошибка при создании архива для Pages', 'error', 3000);
+            } finally {
+                loaderText.textContent = originalText;
+                overlay.classList.remove('show');
+            }
+        });
+
+        // ===== ПЕРСОНАЖИ =====
+        // Интеграция webmeji
+    </script>
+
+    <!-- ======================== ИНТЕГРАЦИЯ WEBMEJI ======================== -->
     <script>
         // ============================================================
         // ПОЛНЫЙ КОД WEBMEJI.JS
