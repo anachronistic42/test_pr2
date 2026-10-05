@@ -4112,7 +4112,15 @@
         }
 
         function urlToDataURL(url) {
-            return fetch(url)
+            let absoluteUrl = url;
+            if (typeof url === 'string'
+                && !url.startsWith('data:')
+                && !url.startsWith('blob:')
+                && !/^https?:\/\//i.test(url)
+                && !url.startsWith('/')) {
+                absoluteUrl = new URL(url, location.href).href;
+            }
+            return fetch(absoluteUrl)
                 .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
                 .then(blob => new Promise((resolve, reject) => {
                     const reader = new FileReader();
@@ -4123,18 +4131,29 @@
         }
 
         async function embedExternalMediaInSlides(slides) {
+            let failures = 0;
             for (const slide of slides) {
                 for (const item of slide.items) {
                     if (item.src && typeof item.src === 'string' && !item.src.startsWith('data:')) {
-                        try { item.src = await urlToDataURL(item.src); } catch (e) { console.error('Не удалось встроить файл:', item.src, e); }
+                        try { item.src = await urlToDataURL(item.src); }
+                        catch (e) { failures++; console.error('Не удалось встроить файл:', item.src, e); }
                     }
                     if (item.cover && typeof item.cover === 'string' && !item.cover.startsWith('data:')) {
-                        try { item.cover = await urlToDataURL(item.cover); } catch (e) { console.error('Не удалось встроить обложку:', item.cover, e); }
+                        try { item.cover = await urlToDataURL(item.cover); }
+                        catch (e) { failures++; console.error('Не удалось встроить обложку:', item.cover, e); }
                     }
                     if (item.poster && typeof item.poster === 'string' && !item.poster.startsWith('data:')) {
-                        try { item.poster = await urlToDataURL(item.poster); } catch (e) { console.error('Не удалось встроить постер:', item.poster, e); }
+                        try { item.poster = await urlToDataURL(item.poster); }
+                        catch (e) { failures++; console.error('Не удалось встроить постер:', item.poster, e); }
                     }
                 }
+            }
+            if (failures > 0) {
+                showNotification(
+                    `Часть медиа не удалось встроить (${failures}). ` +
+                    `Проверьте, что файлы доступны по относительным путям.`,
+                    'error', 6000
+                );
             }
             return slides;
         }
@@ -6176,20 +6195,17 @@
             if (confirmCallback) { confirmCallback(); confirmCallback = null; }
         });
 
-        // ===== ИНИЦИАЛИЗАЦИЯ (отложенная: снимаем pristine-копию до старта boot) =====
-        window.__deferredBoot = function () {
-            state.slides = defaultSlides();
-            state.projectTitle = 'ПОСТПРОСТРАНСТВО';
-            fullRender();
-            goToSlide(0, false);
-            updateFrameScale();
-            setMode('view');
-            document.getElementById('globalSectionControls').style.display = 'none';
+        // ===== ИНИЦИАЛИЗАЦИЯ =====
+        state.slides = defaultSlides();
+        state.projectTitle = 'ПОСТПРОСТРАНСТВО';
+        fullRender();
+        goToSlide(0, false);
+        updateFrameScale();
+        setMode('view');
+        document.getElementById('globalSectionControls').style.display = 'none';
 
-            if (typeof initSelectionBox === 'function') initSelectionBox();
-            if (typeof initIntro === 'function') initIntro();
-        };
-        setTimeout(window.__deferredBoot, 0);
+        initSelectionBox();
+        initIntro();
 
         (function initSlideControls() {
             const STEP = 10;
@@ -6345,11 +6361,19 @@
             if (loaderText) loaderText.textContent = 'Сборка просмотрового HTML...';
 
             try {
-                let htmlContent = window.__PRISTINE_HTML__ || await window.__getPristineHtml__();
+                let htmlContent = null;
+                try {
+                    const resp = await fetch('media/index.html', { cache: 'no-cache' });
+                    if (resp.ok) htmlContent = await resp.text();
+                } catch (e) {
+                    console.warn('Не удалось получить media/index.html:', e);
+                }
+
                 if (!htmlContent) {
-                    showNotification('Не удалось получить чистый шаблон страницы', 'error', 4000);
+                    showNotification('Не найден media/index.html — положите чистый шаблон в папку media', 'error', 6000);
                     return;
                 }
+
                 htmlContent = htmlContent.replace(/<script id="embedded-data-script">[\s\S]*?<\/script>\s*/i, '');
                 const injection = `<script id="embedded-data-script">window.__EMBEDDED_PROJECT__ = ${JSON.stringify(projectData)};<\/script>`;
                 htmlContent = htmlContent.replace('</head>', injection + '\n</head>');
@@ -6371,7 +6395,7 @@
             }
         });
 
-        // ===== СОХРАНИТЬ ДЛЯ PAGES (нумерованные папки ≤ 25 МБ + big_files) =====
+        // ===== СОХРАНИТЬ ДЛЯ PAGES (нумерованные папки ≤ 25 МБ + big_files, media/index.html) =====
         document.getElementById('savePagesBtn').addEventListener('click', async () => {
             toggleSizePopup();
 
@@ -6397,9 +6421,10 @@
 
                 // Состояние активной папки для каждого типа
                 const typeFolders = {};
+                let mediaFetchFailures = 0;
 
                 function createTypeFolder(typeGroup, idx) {
-                    const folderName = `${typeGroup}_${String(idx).padStart(4, '0')}`; // doc_0001, video_0002, ...
+                    const folderName = `${typeGroup}_${String(idx).padStart(4, '0')}`;
                     return {
                         idx,
                         folderName,
@@ -6417,7 +6442,16 @@
                 const addMediaFile = async (src, typeGroup, ext) => {
                     if (!src) return null;
                     try {
-                        const resp = await fetch(src);
+                        // Абсолютный URL — критично для относительных путей "media/..." из project.json
+                        let absoluteSrc = src;
+                        if (typeof src === 'string'
+                            && !src.startsWith('data:')
+                            && !src.startsWith('blob:')
+                            && !/^https?:\/\//i.test(src)
+                            && !src.startsWith('/')) {
+                            absoluteSrc = new URL(src, location.href).href;
+                        }
+                        const resp = await fetch(absoluteSrc);
                         if (!resp.ok) throw new Error('HTTP ' + resp.status);
                         const blob = await resp.blob();
                         const size = blob.size;
@@ -6443,6 +6477,7 @@
                         return `media/${state.folderName}/${fName}`;
                     } catch (e) {
                         console.error('Не удалось добавить файл в архив:', src, e);
+                        mediaFetchFailures++;
                         return null;
                     }
                 };
@@ -6478,6 +6513,14 @@
                     }
                 }
 
+                if (mediaFetchFailures > 0) {
+                    showNotification(
+                        `Не удалось переупаковать файлов: ${mediaFetchFailures}. ` +
+                        `Убедитесь, что папка media доступна по относительным путям рядом с index.html.`,
+                        'error', 7000
+                    );
+                }
+
                 const creaturesData = window.WebmejiManager ? window.WebmejiManager.getCreaturesDataForSave() : null;
                 const cf = document.getElementById('cinematicFrame');
                 const projectData = {
@@ -6492,16 +6535,27 @@
                 zip.file('project.json', JSON.stringify(projectData));
 
                 loaderText.textContent = 'Сборка index.html...';
-                let cleanHtml = window.__PRISTINE_HTML__ || await window.__getPristineHtml__();
+
+                // Основной источник: чистый шаблон, который пользователь кладёт вручную в media/index.html
+                let cleanHtml = null;
+                try {
+                    const resp = await fetch('media/index.html', { cache: 'no-cache' });
+                    if (resp.ok) cleanHtml = await resp.text();
+                } catch (e) {
+                    console.warn('Не удалось получить media/index.html:', e);
+                }
+
                 if (cleanHtml) {
                     cleanHtml = cleanHtml.replace(/<script id="embedded-data-script">[\s\S]*?<\/script>\s*/i, '');
+                    const injection = `<script id="embedded-data-script">window.__EMBEDDED_PROJECT__ = ${JSON.stringify(projectData)};<\/script>`;
+                    cleanHtml = cleanHtml.replace('</head>', injection + '\n</head>');
+                    zip.file('index.html', cleanHtml);
                 } else {
-                    showNotification('Не удалось получить чистый шаблон страницы — используется текущее состояние', 'error', 4000);
-                    const oldScript = document.getElementById('embedded-data-script');
-                    if (oldScript) oldScript.remove();
-                    cleanHtml = '<!DOCTYPE html>\n<html lang="ru">\n' + document.documentElement.outerHTML;
+                    zip.file(
+                        'ОШИБКА index.html НЕ ЗАГРУЗИЛСЯ',
+                        'При упаковке архива что-то пошло не так, для работы с pages скачайте исходный файл index.html из репозитория по ссылке: https://github.com/anachronistic42/postspace'
+                    );
                 }
-                zip.file('index.html', cleanHtml);
 
                 if (hasBigFiles) {
                     zip.file(
@@ -8126,20 +8180,6 @@
                     console.error('Не удалось загрузить project.json:', err);
                     return null;
                 });
-        })();
-    </script>
-
-    <!-- ======================== PRISTINE CAPTURE (снять чистую копию до boot) ======================== -->
-    <script id="pristine-capture-script">
-        // Снимаем чистую копию документа ДО того, как setTimeout(0) запустит boot,
-        // который наполнит #scroller, скроет #introScreen и т.д.
-        (function () {
-            if (window.__PRISTINE_HTML__) return;
-            try {
-                window.__PRISTINE_HTML__ = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
-            } catch (e) {
-                console.warn('Не удалось снять pristine-копию:', e);
-            }
         })();
     </script>
 </body>
