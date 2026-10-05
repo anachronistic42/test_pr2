@@ -15,18 +15,6 @@
             if (isTouch) document.documentElement.classList.add('is-touch');
         })();
     </script>
-    <script>
-        window.__getPristineHtml__ = function() {
-            if (window.__PRISTINE_HTML__) return Promise.resolve(window.__PRISTINE_HTML__);
-            return fetch(location.href, { cache: 'no-cache' })
-                .then(function(r) { return r.ok ? r.text() : null; })
-                .then(function(text) {
-                    if (text) window.__PRISTINE_HTML__ = text;
-                    return text;
-                })
-                .catch(function() { return null; });
-        };
-    </script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script>
@@ -1136,7 +1124,7 @@
             if (sizePopupVisible) updateSizePopupIfVisible();
 
             document.querySelectorAll('.items-layer').forEach(el => {
-                el.style.transform = `translateX(-50%) scale(${slideScale})`;
+                el.style.transform = `translateX(-50%) scale(${slideFrameScale})`;
                 el.style.width = slideW + 'px';
                 el.style.height = slideH + 'px';
             });
@@ -4111,54 +4099,158 @@
             updateSizePopupIfVisible();
         }
 
-        function urlToDataURL(url) {
-            let absoluteUrl = url;
-            if (typeof url === 'string'
-                && !url.startsWith('data:')
-                && !url.startsWith('blob:')
-                && !/^https?:\/\//i.test(url)
-                && !url.startsWith('/')) {
-                absoluteUrl = new URL(url, location.href).href;
+        // ============================================================
+        //  ВНЕШНЯЯ ПАПКА media: чтение файлов, когда fetch() недоступен (file://)
+        // ============================================================
+        const MEDIA_INDEX_PATH = 'media/index.html';
+        let pickedMediaIndex = null;
+
+        function isExternalMediaPath(s) {
+            return typeof s === 'string' && s && !/^(data:|blob:|https?:|\/\/)/i.test(s);
+        }
+
+        function normMediaPath(s) {
+            let p = String(s).split('#')[0].split('?')[0].replace(/\\/g, '/').replace(/^\.\//, '');
+            try { p = decodeURIComponent(p); } catch (e) {}
+            return p.toLowerCase();
+        }
+
+        // Индексируем все «хвосты» пути, поэтому не важно, выбрана папка media или её родитель
+        function buildPickedIndex(files) {
+            const idx = new Map();
+            for (const f of files) {
+                const parts = normMediaPath(f.webkitRelativePath || f.name).split('/');
+                for (let i = 0; i < parts.length; i++) {
+                    const key = parts.slice(i).join('/');
+                    if (!idx.has(key)) idx.set(key, f);
+                }
             }
-            return fetch(absoluteUrl)
-                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
-                .then(blob => new Promise((resolve, reject) => {
+            return idx;
+        }
+
+        function pickMediaFolder() {
+            return new Promise(resolve => {
+                const inp = document.createElement('input');
+                inp.type = 'file';
+                inp.webkitdirectory = true;
+                inp.multiple = true;
+                inp.style.display = 'none';
+                document.body.appendChild(inp);
+                const done = ok => { inp.remove(); resolve(ok); };
+                inp.addEventListener('change', () => {
+                    if (inp.files && inp.files.length) {
+                        pickedMediaIndex = buildPickedIndex(Array.from(inp.files));
+                        done(true);
+                    } else done(false);
+                });
+                inp.addEventListener('cancel', () => done(false));
+                inp.click();
+            });
+        }
+
+        // showConfirm не умеет «отмену», поэтому оборачиваем в Promise.
+        // Диалог выбора папки открывается прямо из клика по «ОК», иначе браузер его заблокирует.
+        function askMediaFolder(message) {
+            return new Promise(resolve => {
+                const cancelBtn = document.getElementById('confirmCancel');
+                const onCancel = () => resolve(false);
+                cancelBtn.addEventListener('click', onCancel, { once: true });
+                showConfirm(message, () => {
+                    cancelBtn.removeEventListener('click', onCancel);
+                    pickMediaFolder().then(resolve);
+                });
+            });
+        }
+
+        // Единая точка чтения файла: сначала fetch, затем выбранная папка
+        async function getMediaBlob(src) {
+            if (!src) return null;
+            try {
+                const r = await fetch(src);
+                if (r.ok) return await r.blob();
+            } catch (e) {}
+            if (pickedMediaIndex && isExternalMediaPath(src)) {
+                const key = normMediaPath(src);
+                let f = pickedMediaIndex.get(key);
+                // если пользователь выбрал саму папку media, ключ 'media/...' не сработает — пробуем без префикса
+                if (!f && key.startsWith('media/')) f = pickedMediaIndex.get(key.substring(6));
+                if (f) return f; // File — это Blob
+            }
+            return null;
+        }
+
+        async function fetchWorks(p) {
+            try { const r = await fetch(p); if (r.body) r.body.cancel(); return true; } // любой HTTP-ответ = fetch работает
+            catch (e) { return false; }                                                  // file:// -> исключение
+        }
+
+        // Вызывать ДО показа loadingOverlay (он перекрывает диалог). true = можно продолжать.
+        async function ensureMediaAccess(slides, needIndex = false) {
+            const paths = [];
+            for (const s of slides) for (const it of s.items)
+                for (const k of ['src', 'cover', 'poster'])
+                    if (isExternalMediaPath(it[k])) paths.push(it[k]);
+
+            const probe = paths[0] || (needIndex ? MEDIA_INDEX_PATH : null);
+            if (!probe) return true;
+            if (await fetchWorks(probe)) return true;
+            if (pickedMediaIndex && paths.every(p => {
+                const k = normMediaPath(p);
+                return pickedMediaIndex.has(k) || (k.startsWith('media/') && pickedMediaIndex.has(k.substring(6)));
+            })) return true;
+
+            return askMediaFolder(
+                'Браузер не даёт читать файлы из папки media напрямую. ' +
+                'Выберите папку media (или папку, где лежат project.json и media).'
+            );
+        }
+
+        // Чистый index.html, который пользователь кладёт в media/ руками
+        async function loadCleanIndexBlob() {
+            const looksLikeHtml = async b => /<(!doctype|html)/i.test(await b.slice(0, 4096).text());
+            try { // Pages или локальный сервер
+                const r = await fetch(MEDIA_INDEX_PATH, { cache: 'no-cache' });
+                if (r.ok) { const b = await r.blob(); if (await looksLikeHtml(b)) return b; }
+            } catch (e) {}
+            const f = pickedMediaIndex && (pickedMediaIndex.get(MEDIA_INDEX_PATH) || pickedMediaIndex.get('index.html'));
+            if (f && await looksLikeHtml(f)) return f;
+            return null;
+        }
+
+        function urlToDataURL(url) {
+            return getMediaBlob(url).then(blob => {
+                if (!blob) throw new Error('Файл недоступен: ' + url);
+                return new Promise((resolve, reject) => {
                     const reader = new FileReader();
                     reader.onload = () => resolve(reader.result);
                     reader.onerror = () => reject(reader.error);
                     reader.readAsDataURL(blob);
-                }));
+                });
+            });
         }
 
         async function embedExternalMediaInSlides(slides) {
-            let failures = 0;
+            let failed = 0;
             for (const slide of slides) {
                 for (const item of slide.items) {
-                    if (item.src && typeof item.src === 'string' && !item.src.startsWith('data:')) {
-                        try { item.src = await urlToDataURL(item.src); }
-                        catch (e) { failures++; console.error('Не удалось встроить файл:', item.src, e); }
-                    }
-                    if (item.cover && typeof item.cover === 'string' && !item.cover.startsWith('data:')) {
-                        try { item.cover = await urlToDataURL(item.cover); }
-                        catch (e) { failures++; console.error('Не удалось встроить обложку:', item.cover, e); }
-                    }
-                    if (item.poster && typeof item.poster === 'string' && !item.poster.startsWith('data:')) {
-                        try { item.poster = await urlToDataURL(item.poster); }
-                        catch (e) { failures++; console.error('Не удалось встроить постер:', item.poster, e); }
+                    for (const key of ['src', 'cover', 'poster']) {
+                        const v = item[key];
+                        if (typeof v === 'string' && v && !v.startsWith('data:')) {
+                            try { item[key] = await urlToDataURL(v); }
+                            catch (e) { failed++; console.error('Не удалось встроить:', v, e); }
+                        }
                     }
                 }
             }
-            if (failures > 0) {
-                showNotification(
-                    `Часть медиа не удалось встроить (${failures}). ` +
-                    `Проверьте, что файлы доступны по относительным путям.`,
-                    'error', 6000
-                );
-            }
-            return slides;
+            return failed;
         }
 
         async function saveProject() {
+            const slidesForSave = JSON.parse(JSON.stringify(state.slides));
+            if (!(await ensureMediaAccess(slidesForSave))) {
+                showNotification('Сохранение отменено: нет доступа к папке media', 'error', 4000);
+                return;
+            }
             const overlay = document.getElementById('loadingOverlay');
             const loaderText = overlay ? overlay.querySelector('.loader-text') : null;
             const originalText = loaderText ? loaderText.textContent : '';
@@ -4166,8 +4258,8 @@
                 if (overlay) overlay.classList.add('show');
                 if (loaderText) loaderText.textContent = 'Сохранение проекта...';
 
-                const slidesForSave = JSON.parse(JSON.stringify(state.slides));
-                await embedExternalMediaInSlides(slidesForSave);
+                const failed = await embedExternalMediaInSlides(slidesForSave);
+                if (failed) showNotification(`Не удалось встроить файлов: ${failed}. Они останутся ссылками`, 'error', 7000);
 
                 const creaturesData = window.WebmejiManager ? window.WebmejiManager.getCreaturesDataForSave() : null;
                 const cf = document.getElementById('cinematicFrame');
@@ -6196,16 +6288,19 @@
         });
 
         // ===== ИНИЦИАЛИЗАЦИЯ =====
-        state.slides = defaultSlides();
-        state.projectTitle = 'ПОСТПРОСТРАНСТВО';
-        fullRender();
-        goToSlide(0, false);
-        updateFrameScale();
-        setMode('view');
-        document.getElementById('globalSectionControls').style.display = 'none';
+        window.__deferredBoot = function () {
+            state.slides = defaultSlides();
+            state.projectTitle = 'ПОСТПРОСТРАНСТВО';
+            fullRender();
+            goToSlide(0, false);
+            updateFrameScale();
+            setMode('view');
+            document.getElementById('globalSectionControls').style.display = 'none';
 
-        initSelectionBox();
-        initIntro();
+            if (typeof initSelectionBox === 'function') initSelectionBox();
+            if (typeof initIntro === 'function') initIntro();
+        };
+        setTimeout(window.__deferredBoot, 0);
 
         (function initSlideControls() {
             const STEP = 10;
@@ -6342,6 +6437,12 @@
 
         document.getElementById('exportHtmlBtn').addEventListener('click', async () => {
             toggleSizePopup();
+
+            if (!(await ensureMediaAccess(state.slides, true))) {
+                showNotification('Экспорт отменён: нет доступа к папке media', 'error', 4000);
+                return;
+            }
+
             const creaturesData = window.WebmejiManager ? window.WebmejiManager.getCreaturesDataForSave() : null;
             const cf = document.getElementById('cinematicFrame');
             const projectData = {
@@ -6361,24 +6462,17 @@
             if (loaderText) loaderText.textContent = 'Сборка просмотрового HTML...';
 
             try {
-                let htmlContent = null;
-                try {
-                    const resp = await fetch('media/index.html', { cache: 'no-cache' });
-                    if (resp.ok) htmlContent = await resp.text();
-                } catch (e) {
-                    console.warn('Не удалось получить media/index.html:', e);
-                }
-
-                if (!htmlContent) {
-                    showNotification('Не найден media/index.html — положите чистый шаблон в папку media', 'error', 6000);
+                const indexBlob = await loadCleanIndexBlob();
+                if (!indexBlob) {
+                    showNotification('Не удалось получить чистый шаблон страницы (media/index.html)', 'error', 4000);
                     return;
                 }
-
+                let htmlContent = await indexBlob.text();
                 htmlContent = htmlContent.replace(/<script id="embedded-data-script">[\s\S]*?<\/script>\s*/i, '');
                 const injection = `<script id="embedded-data-script">window.__EMBEDDED_PROJECT__ = ${JSON.stringify(projectData)};<\/script>`;
                 htmlContent = htmlContent.replace('</head>', injection + '\n</head>');
 
-                const blob = new Blob(['<!DOCTYPE html>\n<html lang="ru">\n' + htmlContent], { type: 'text/html;charset=utf-8' });
+                const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
                 const a = document.createElement('a');
                 a.href = URL.createObjectURL(blob);
                 let filename = (state.projectTitle || "postprostranstvo").replace(/[\\/:*?"<>|]/g, '_').trim();
@@ -6395,9 +6489,14 @@
             }
         });
 
-        // ===== СОХРАНИТЬ ДЛЯ PAGES (нумерованные папки ≤ 25 МБ + big_files, media/index.html) =====
+        // ===== СОХРАНИТЬ ДЛЯ PAGES (нумерованные папки ≤ 25 МБ + big_files) =====
         document.getElementById('savePagesBtn').addEventListener('click', async () => {
             toggleSizePopup();
+
+            if (!(await ensureMediaAccess(state.slides, true))) {
+                showNotification('Сохранение отменено: нет доступа к папке media', 'error', 4000);
+                return;
+            }
 
             const overlay = document.getElementById('loadingOverlay');
             overlay.classList.add('show');
@@ -6411,17 +6510,15 @@
                 // Порог 25 МБ — лимит Github Pages для одного файла по умолчанию
                 const MAX_FOLDER_SIZE = 25 * 1024 * 1024;
 
-                // Корневые папки создаём лениво, чтобы пустых папок не было
                 let mediaRoot = null;
                 let bigFilesRoot = null;
                 let hasBigFiles = false;
+                let failedMedia = 0;
 
                 const getMediaRoot = () => mediaRoot || (mediaRoot = zip.folder('media'));
                 const getBigFilesRoot = () => bigFilesRoot || (bigFilesRoot = zip.folder('big_files'));
 
-                // Состояние активной папки для каждого типа
                 const typeFolders = {};
-                let mediaFetchFailures = 0;
 
                 function createTypeFolder(typeGroup, idx) {
                     const folderName = `${typeGroup}_${String(idx).padStart(4, '0')}`;
@@ -6442,18 +6539,8 @@
                 const addMediaFile = async (src, typeGroup, ext) => {
                     if (!src) return null;
                     try {
-                        // Абсолютный URL — критично для относительных путей "media/..." из project.json
-                        let absoluteSrc = src;
-                        if (typeof src === 'string'
-                            && !src.startsWith('data:')
-                            && !src.startsWith('blob:')
-                            && !/^https?:\/\//i.test(src)
-                            && !src.startsWith('/')) {
-                            absoluteSrc = new URL(src, location.href).href;
-                        }
-                        const resp = await fetch(absoluteSrc);
-                        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                        const blob = await resp.blob();
+                        const blob = await getMediaBlob(src);
+                        if (!blob) throw new Error('Файл недоступен: ' + src);
                         const size = blob.size;
 
                         // Файл > 25 МБ → в big_files (в корне архива)
@@ -6464,20 +6551,20 @@
                             return `big_files/${baseName}`;
                         }
 
-                        let state = getActiveFolder(typeGroup);
-                        if (state.size + size > MAX_FOLDER_SIZE) {
-                            state = createTypeFolder(typeGroup, state.idx + 1);
-                            typeFolders[typeGroup] = state;
+                        let folderState = getActiveFolder(typeGroup);
+                        if (folderState.size + size > MAX_FOLDER_SIZE) {
+                            folderState = createTypeFolder(typeGroup, folderState.idx + 1);
+                            typeFolders[typeGroup] = folderState;
                         }
 
-                        state.fileCount++;
-                        const fName = `${typeGroup}_${String(state.fileCount).padStart(3, '0')}.${ext}`;
-                        state.folder.file(fName, blob);
-                        state.size += size;
-                        return `media/${state.folderName}/${fName}`;
+                        folderState.fileCount++;
+                        const fName = `${typeGroup}_${String(folderState.fileCount).padStart(3, '0')}.${ext}`;
+                        folderState.folder.file(fName, blob);
+                        folderState.size += size;
+                        return `media/${folderState.folderName}/${fName}`;
                     } catch (e) {
+                        failedMedia++;
                         console.error('Не удалось добавить файл в архив:', src, e);
-                        mediaFetchFailures++;
                         return null;
                     }
                 };
@@ -6513,14 +6600,6 @@
                     }
                 }
 
-                if (mediaFetchFailures > 0) {
-                    showNotification(
-                        `Не удалось переупаковать файлов: ${mediaFetchFailures}. ` +
-                        `Убедитесь, что папка media доступна по относительным путям рядом с index.html.`,
-                        'error', 7000
-                    );
-                }
-
                 const creaturesData = window.WebmejiManager ? window.WebmejiManager.getCreaturesDataForSave() : null;
                 const cf = document.getElementById('cinematicFrame');
                 const projectData = {
@@ -6534,26 +6613,16 @@
                 };
                 zip.file('project.json', JSON.stringify(projectData));
 
-                loaderText.textContent = 'Сборка index.html...';
-
-                // Основной источник: чистый шаблон, который пользователь кладёт вручную в media/index.html
-                let cleanHtml = null;
-                try {
-                    const resp = await fetch('media/index.html', { cache: 'no-cache' });
-                    if (resp.ok) cleanHtml = await resp.text();
-                } catch (e) {
-                    console.warn('Не удалось получить media/index.html:', e);
-                }
-
-                if (cleanHtml) {
-                    cleanHtml = cleanHtml.replace(/<script id="embedded-data-script">[\s\S]*?<\/script>\s*/i, '');
-                    const injection = `<script id="embedded-data-script">window.__EMBEDDED_PROJECT__ = ${JSON.stringify(projectData)};<\/script>`;
-                    cleanHtml = cleanHtml.replace('</head>', injection + '\n</head>');
-                    zip.file('index.html', cleanHtml);
+                loaderText.textContent = 'Подключение index.html...';
+                const indexBlob = await loadCleanIndexBlob();
+                if (indexBlob) {
+                    zip.file('index.html', indexBlob);        // корень архива — для Pages
+                    zip.file('media/index.html', indexBlob);  // копия в media — основа для следующей упаковки
                 } else {
                     zip.file(
-                        'ОШИБКА index.html НЕ ЗАГРУЗИЛСЯ',
-                        'При упаковке архива что-то пошло не так, для работы с pages скачайте исходный файл index.html из репозитория по ссылке: https://github.com/anachronistic42/postspace'
+                        'ОШИБКА index.html НЕ ЗАГРУЗИЛСЯ.txt',
+                        'При упаковке архива что-то пошло не так, для работы с pages скачайте исходный файл index.html ' +
+                        'из репозитория по ссылке: https://github.com/anachronistic42/postspace'
                     );
                 }
 
@@ -6575,7 +6644,11 @@
                 if (!filename) filename = "postprostranstvo";
                 a.download = filename + "_pages.zip";
                 a.click();
-                showNotification('Архив для Pages сохранён', 'success', 3000);
+                if (failedMedia) {
+                    showNotification(`Архив сохранён, но ${failedMedia} файл(ов) не найдено — проверьте папку media`, 'error', 7000);
+                } else {
+                    showNotification('Архив для Pages сохранён', 'success', 3000);
+                }
             } catch (err) {
                 console.error(err);
                 showNotification('Ошибка при создании архива для Pages', 'error', 3000);
